@@ -1,4 +1,12 @@
 # Byte-compiled / optimized / DLL files
+*.p
+**/cached_pmi_model.p
+*.zip
+/cache/
+/data/
+/demo/data/
+**/__pycache_/
+**/.idea/
 __pycache__/
 *.py[cod]
 *$py.class
