@@ -1,5 +1,6 @@
 # coding=utf-8
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import numpy as np
 from collections import Counter
 
@@ -62,16 +63,18 @@ class PMIModel(object):
             self.pair_counter[pair_id] = count / num_windows
 
     def transform(self, word0, word1):
-        a = self.word_counter[word0]
-        b = self.word_counter[word1]
+        prob_a = self.word_counter[word0]
+        prob_b = self.word_counter[word1]
         pair_id = self.get_pair_id(word0, word1)
-        c = self.pair_counter[pair_id]
+        prob_pair = self.pair_counter[pair_id]
 
-        if a == 0 or b == 0 or c == 0:
+        if prob_a == 0 or prob_b == 0 or prob_pair == 0:
             return 0
 
-        pmi = np.log(a / (b * c))
+        pmi = np.log(prob_pair / (prob_a * prob_b))
+        # print(word0, word1, pmi)
         pmi = np.maximum(pmi, 0.0)
+        # print(pmi)
         return pmi
 
 
@@ -100,6 +103,8 @@ def build_combined_graph(word_graph, sequences, embedding_size):
         for word in sequence:
             edges.append([doc_node_index, word])  # only directed edge
             edge_weight.append(1.0)  # use BOW instaead of TF-IDF
+
+
     edge_index = np.array(edges).T
     x = tf.concat([word_graph.x, x], axis=0)
     edge_index = np.concatenate([word_graph.edge_index, edge_index], axis=1)
@@ -114,13 +119,12 @@ if os.path.exists(pmi_cache_path):
         pmi_model = pickle.load(f)
 else:
     pmi_model = PMIModel()
-    pmi_model.fit(train_sequences, window_size=10)
+    pmi_model.fit(train_sequences, window_size=6)
     with open(pmi_cache_path, "wb") as f:
         pickle.dump(pmi_model, f)
 
 
-
-embedding_size = 50
+embedding_size = 150
 num_words = len(tokenizer.word_index)
 word_graph = build_word_graph(num_words, pmi_model, embedding_size)
 train_combined_graph = build_combined_graph(word_graph, train_sequences, embedding_size)
@@ -132,9 +136,9 @@ print(test_combined_graph)
 
 
 num_classes = 2
-gcn0 = tfg.layers.GCN(32, activation=tf.nn.relu)
+gcn0 = tfg.layers.GCN(100, activation=tf.nn.relu)
 gcn1 = tfg.layers.GCN(num_classes)
-dropout = keras.layers.Dropout(0.2)
+dropout = keras.layers.Dropout(0.5)
 
 
 def forward(graph, training=False):
@@ -144,7 +148,7 @@ def forward(graph, training=False):
     return h
 
 
-optimizer = tf.train.AdamOptimizer(learning_rate=1e-2)
+optimizer = tf.train.AdamOptimizer(learning_rate=5e-2)
 for step in range(1000):
     with tf.GradientTape() as tape:
         logits = forward(train_combined_graph, training=True)[num_words:]

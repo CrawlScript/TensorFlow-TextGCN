@@ -5,6 +5,7 @@ Efficient implementation of "Graph Convolutional Networks for Text Classificatio
 
 + Python >= 3.5
 + tqdm: `pip install tqdm`
++ scikit-learn: `pip install scikit-learn`
 + TensorFlow >=1.14.0 or >=2.0.0
 + tf_geometric:
 Use one of the following commands below to install tf_geometric (and tensorflow):
