@@ -128,7 +128,7 @@ else:
         pickle.dump(pmi_model, f)
 
 embedding_size = 150
-num_words = len(tokenizer.word_index)
+num_words = len(tokenizer.word_index) + 1
 word_graph = build_word_graph(num_words, pmi_model, embedding_size)
 train_combined_graph = build_combined_graph(word_graph, train_sequences, embedding_size)
 test_combined_graph = build_combined_graph(word_graph, test_sequences, embedding_size)
