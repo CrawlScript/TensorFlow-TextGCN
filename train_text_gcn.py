@@ -2,6 +2,7 @@
 import os
 
 from tf_geometric.utils import tf_utils
+from tf_geometric.utils.graph_utils import convert_edge_to_directed
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import numpy as np
@@ -17,6 +18,9 @@ import tf_geometric as tfg
 import pickle
 
 data_dir = "datasets/rt-polarity"
+
+lr = 1e-4
+l2_coef = 3e-3
 
 texts = []
 labels = []
@@ -84,7 +88,7 @@ class PMIModel(object):
 
 def build_word_graph(num_words, pmi_model, embedding_size):
     x = tf.Variable(tf.random.truncated_normal([num_words, embedding_size], stddev=1 / np.sqrt(embedding_size)),
-                    dtype=tf.float32)
+                    dtype=tf.float32, name="word_embedding")
     edges = []
     edge_weight = []
     for (word0, word1) in pmi_model.pair_counter.keys():
@@ -100,7 +104,7 @@ def build_word_graph(num_words, pmi_model, embedding_size):
 
 def build_combined_graph(word_graph, sequences, embedding_size):
     num_words = word_graph.num_nodes
-    x = tf.zeros([len(sequences), embedding_size], dtype=tf.float32)
+
     edges = []
     edge_weight = []
     for i, sequence in enumerate(sequences):
@@ -110,10 +114,18 @@ def build_combined_graph(word_graph, sequences, embedding_size):
             edge_weight.append(1.0)  # use BOW instaead of TF-IDF
 
     edge_index = np.array(edges).T
-    x = tf.concat([word_graph.x, x], axis=0)
+
     edge_index = np.concatenate([word_graph.edge_index, edge_index], axis=1)
     edge_weight = np.concatenate([word_graph.edge_weight, edge_weight], axis=0)
-    return tfg.Graph(x=x, edge_index=edge_index, edge_weight=edge_weight)
+
+    # edge_index, [edge_weight] = convert_edge_to_directed(edge_index, edge_props=[edge_weight], merge_modes=["sum"])
+
+    x = tf.zeros([len(sequences), embedding_size], dtype=tf.float32)
+
+    def x_func():
+        return tf.concat([word_graph.x, x], axis=0)
+
+    return x_func, edge_index, edge_weight
 
 
 # building PMI model is time consuming, using cache to optimize
@@ -130,12 +142,10 @@ else:
 embedding_size = 150
 num_words = len(tokenizer.word_index) + 1
 word_graph = build_word_graph(num_words, pmi_model, embedding_size)
-train_combined_graph = build_combined_graph(word_graph, train_sequences, embedding_size)
-test_combined_graph = build_combined_graph(word_graph, test_sequences, embedding_size)
+train_x_func, train_edge_index, train_edge_weight = build_combined_graph(word_graph, train_sequences, embedding_size)
+test_x_func, test_edge_index, test_edge_weight = build_combined_graph(word_graph, test_sequences, embedding_size)
 
 print(word_graph)
-print(train_combined_graph)
-print(test_combined_graph)
 
 num_classes = 2
 
@@ -144,30 +154,34 @@ class GCNModel(tf.keras.Model):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.gcn0 = tfg.layers.GCN(100, activation=tf.nn.relu)
-        self.gcn1 = tfg.layers.GCN(num_classes)
+        self.gcn0 = tfg.layers.GCN(num_classes)
         self.dropout = keras.layers.Dropout(0.5)
 
     def call(self, inputs, training=None, mask=None, cache=None):
         x, edge_index, edge_weight = inputs
-        h = self.gcn0([x, edge_index, edge_weight], cache=cache)
-        h = self.dropout(h, training=training)
-        h = self.gcn1([h, edge_index, edge_weight], cache=cache)
+        h = self.dropout(x, training=training)
+        h = self.gcn0([h, edge_index, edge_weight], cache=cache)
         return h
 
 
 model = GCNModel()
-model.gcn0.cache_normed_edge(train_combined_graph)
-model.gcn0.cache_normed_edge(test_combined_graph)
 
 
-@tf_utils.function
-def forward(graph, training=False):
-    logits = model([graph.x, graph.edge_index, graph.edge_weight], cache=graph.cache, training=training)
+def forward(x_func, edge_index, edge_weight, cache=None, training=False):
+    x = x_func()
+    logits = model([x, edge_index, edge_weight], cache=cache, training=training)
     logits = logits[num_words:]
     return logits
 
 
+# build cache outside tf.function
+train_cache = {}
+test_cache = {}
+forward(train_x_func, train_edge_index, train_edge_weight, cache=train_cache)
+forward(test_x_func, test_edge_index, test_edge_weight, cache=test_cache)
+
+
+@tf_utils.function
 def compute_loss(logits, labels):
     losses = tf.nn.softmax_cross_entropy_with_logits(
         logits=logits,
@@ -177,19 +191,32 @@ def compute_loss(logits, labels):
     return mean_loss
 
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=5e-2)
-for step in tqdm(range(1000)):
+@tf_utils.function
+def train_step():
     with tf.GradientTape() as tape:
-        logits = forward(train_combined_graph, training=True)
+        logits = forward(train_x_func, train_edge_index, train_edge_weight, cache=train_cache, training=True)
         mean_loss = compute_loss(logits, train_labels)
+
+        l2_vars = [var for var in tape.watched_variables() if "kernel" in var.name or "embedding" in var.name]
+        l2_losses = [tf.nn.l2_loss(var) for var in l2_vars]
+        l2_loss = tf.add_n(l2_losses)
+        loss = mean_loss + l2_coef * l2_loss
 
     vars = tape.watched_variables()
     grads = tape.gradient(mean_loss, vars)
     optimizer.apply_gradients(zip(grads, vars))
+    return loss
+
+
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+for step in tqdm(range(1000)):
+
+    loss = train_step()
 
     if step % 10 == 0:
-        logits = forward(test_combined_graph)
+        logits = forward(test_x_func, test_edge_index, test_edge_weight, cache=test_cache)
         preds = tf.argmax(logits, axis=-1)
         corrects = tf.cast(tf.equal(preds, test_labels), tf.float32)
         accuracy = tf.reduce_mean(corrects)
-        print("step = {}\tloss = {}\ttest_accuracy = {}".format(step, mean_loss, accuracy))
+        print("step = {}\tloss = {}\ttest_accuracy = {}".format(step, loss, accuracy))
